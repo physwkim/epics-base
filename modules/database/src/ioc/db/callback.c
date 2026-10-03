@@ -811,8 +811,12 @@ void callbackInit(void)
 
         if (callbackQueue[i].threadsConfigured == 0)
             callbackQueue[i].threadsConfigured = callbackThreadsDefault;
-        if (callbackQueue[i].threadsConfigured > (int)CB_MAX_WORKERS)
+        if (callbackQueue[i].threadsConfigured > (int)CB_MAX_WORKERS) {
+            errlogPrintf("callbackInit: %d %s threads requested, using the limit of %d\n",
+                callbackQueue[i].threadsConfigured, threadNamePrefix[i],
+                (int)CB_MAX_WORKERS);
             callbackQueue[i].threadsConfigured = CB_MAX_WORKERS;
+        }
 
         callbackQueue[i].workersRaw = callocMustSucceed(1,
             callbackQueue[i].threadsConfigured * sizeof(*callbackQueue[i].workers) + CB_WORKER_ALIGN,
