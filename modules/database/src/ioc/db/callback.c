@@ -444,11 +444,14 @@ static int wakeOne(cbQueueSet *mySet, cbNode *list, int n)
     return 0;
 }
 
-/* wake one sleeping worker with nothing to hand over; retry when the
- * claim fails, since the request may then still be unseen. Tries the
- * hinted workers first, then every worker once if nAwake says one
- * sleeps: a sharer stopped after taking a bit leaves none. A worker
- * found in neither pass is leaving its sleep and reads the inbox. */
+/* wake one sleeping worker with nothing to hand over. One trigger is
+ * enough even when the claim fails: the worker then left its sleep by
+ * itself after the request was pushed and reads the inbox next. (A
+ * retry would never end on one core where the worker preempts the
+ * trigger, runs, and sleeps again before the claim.) Tries the hinted
+ * workers first, then every worker once if nAwake says one sleeps: a
+ * sharer stopped after taking a bit leaves none. A worker found in
+ * neither pass is leaving its sleep and reads the inbox. */
 static void pokeSleeper(cbQueueSet *mySet)
 {
     size_t m = epicsAtomicGetSizeT(&mySet->sleepers);
@@ -461,18 +464,22 @@ static void pokeSleeper(cbQueueSet *mySet)
         {
             cbWorker *w = &mySet->workers[i];
             size_t s = epicsAtomicGetSizeT(&w->state);
-            if (CB_ST(s) == CB_SLEEPING && triggerAndClaim(mySet, w, s))
+            if (CB_ST(s) == CB_SLEEPING) {
+                triggerAndClaim(mySet, w, s);
                 return;
+            }
         }
-        /* that worker moved on by itself; scan again */
+        /* its bit was stale: that worker is leaving its sleep; scan again */
         m = epicsAtomicGetSizeT(&mySet->sleepers);
     }
     if (epicsAtomicGetIntT(&mySet->nAwake) < mySet->threadsConfigured) {
         for (i = 0; i < mySet->threadsConfigured; i++) {
             cbWorker *w = &mySet->workers[i];
             size_t s = epicsAtomicGetSizeT(&w->state);
-            if (CB_ST(s) == CB_SLEEPING && triggerAndClaim(mySet, w, s))
+            if (CB_ST(s) == CB_SLEEPING) {
+                triggerAndClaim(mySet, w, s);
                 return;
+            }
         }
     }
 }
