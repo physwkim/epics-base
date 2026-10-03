@@ -233,6 +233,11 @@ int callbackSetQueueSize(int size)
         fprintf(stderr, "Queue size must be positive\n");
         return -1;
     }
+    if ((size_t)size >= CB_IDX_NONE) {
+        fprintf(stderr, "Queue size must be below %lu\n",
+            (unsigned long)CB_IDX_NONE);
+        return -1;
+    }
     if (epicsAtomicGetIntT(&cbState)!=cbInit) {
         fprintf(stderr, "Callback system already initialized\n");
         return -1;
