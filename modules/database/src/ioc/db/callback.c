@@ -51,55 +51,41 @@
 
 static int callbackQueueSize = 2000;
 
-/* Each request takes a node from a lock-free pool of callbackQueueSize
- * nodes (so the same epicsCallback may be queued several times, as with
- * the ring buffer, and the pool running out is the "buffer full" error)
- * and pushes it onto an intrusive LIFO with one CAS. Neither has an
- * owner, so a preempted requester can never block a worker. A worker
- * takes the whole LIFO with one CAS and reverses it, restoring FIFO,
- * runs it in batches of CB_SHARE_EVERY and publishes the rest in its
- * pending slot. Before each callback a worker that still holds pending
- * work hands half of it to a sleeping worker, so no request waits in a
- * worker's hand while another worker sleeps. No lock anywhere on the
- * request path, no shared wake-up event, and no change to epicsCallback.
+/* Requests take a node from a lock-free pool of callbackQueueSize
+ * nodes (the pool running out is the "buffer full" error) and push it
+ * onto a LIFO inbox with one CAS; nothing on the request path has an
+ * owner, so a preempted requester never blocks a worker. A worker
+ * takes the whole inbox with one CAS, reverses it to FIFO and runs it
+ * from its pending slot one node at a time. Before each callback it
+ * hands the older half of what it still holds, plus whatever the
+ * inbox has meanwhile, to a sleeping worker, if any.
  *
- * Each worker has its own event and a state word: AWAKE, SLEEPING or
- * CLAIMED, tagged with the sleep epoch; only the worker moves out of
- * CLAIMED. A wake triggers the worker's event first and claims the
- * worker second, so a thread stopped between the two steps leaves
- * nothing that others wait for; the claim is a CAS on the state word,
- * so it can never land on a later sleep than the one its trigger woke.
- * A handed-over list is stored in the worker's handoff slot before the
- * trigger and is taken by the worker at the top of its loop and before
- * it sleeps, so it is delivered whether or not the claim succeeds; the
- * slot is a stack, so a second list handed over before the first was
- * taken joins it.
+ * Each worker has its own event and a state word (AWAKE, SLEEPING or
+ * CLAIMED, tagged with the sleep epoch). A waker triggers the event
+ * first and claims the worker by CAS second, so a thread stopped
+ * between the two leaves nothing others wait for, and a claim never
+ * lands on a later sleep. A list handed over goes into the worker's
+ * handoff slot before the trigger; the worker takes the slot at the
+ * top of its loop and before sleeping, so it arrives whether or not
+ * the claim succeeds. A sleeping worker's bit in sleepers is a hint,
+ * taken by CAS by whoever wants that sleeper; nAwake counts the
+ * workers not sleeping, and a waker that finds no bit while nAwake
+ * says one sleeps scans the state words instead.
  *
- * A worker sets its bit in sleepers before it sleeps. The bit is taken
- * by CAS by the first thread that wants that sleeper, before anything
- * else it does, so other threads see at once that the sleeper is spoken
- * for and keep their work; the worker clears the bit itself if nobody
- * took it. The bit is a hint, never the truth: a request that finds no
- * bit while nAwake says a worker sleeps scans the state words, so a
- * thread stopped between taking a bit and triggering hides that worker
- * from sharers only, not from the rescue.
- *
- * A requester wakes a worker only when none is awake, plus one rescue
- * for a worker stopped where the kernel cannot migrate it: when exactly
- * one worker is counted awake and no batch was started for CB_STALE_US,
- * the requester wakes another. Time, not a request count, since the
- * requesters may be slow while the backlog they see is stuck. Once two
- * are counted the second either runs or was woken by the first, which
- * recruits by handing over work. An idle worker also steals from
- * another worker's handoff or pending slot before sleeping, looking at
- * most once per CB_STEAL_AGE_NS and taking only a list it already saw
- * there at its previous look while the owner made no progress since: a
- * running worker empties its slots within microseconds, a stopped one
- * does not, so a stopped worker holds at most one batch and a running
- * one is never robbed.
+ * A requester wakes a worker when none is awake, or when one sleeps
+ * while every awake one is busy: a worker marks itself busy before
+ * each callback and only then looks at the inbox and the sleepers, so
+ * either the request sees the mark or the worker sees the request.
+ * Only a request that found the inbox empty owes that check, as one
+ * already there has a worker on its way whose take-all covers both.
+ * One rescue remains for a worker preempted where it cannot migrate:
+ * when a single worker is counted awake and none made progress for
+ * CB_STALE_US, the requester wakes another. Before sleeping a worker
+ * also takes the slots of a busy worker, and of one that made no
+ * progress since its previous look CB_STEAL_AGE_NS or more earlier.
  */
 #ifndef CB_SHARE_EVERY
-#define CB_SHARE_EVERY 16
+#define CB_SHARE_EVERY 16   /* callbacks run between progress updates */
 #endif
 #ifndef CB_STALE_US
 #define CB_STALE_US 20
@@ -130,7 +116,7 @@ static unsigned cbLowBit(size_t m)
 #  define CB_LOWBIT(m) cbLowBit(m)
 #endif
 
-/* each worker on its own cache lines: the slots are written per batch */
+/* each worker on its own cache lines: the slots are written per callback */
 #define CB_WORKER_ALIGN 128
 #if defined(_MSC_VER)
 #  define CB_ALIGN_PRE  __declspec(align(CB_WORKER_ALIGN))
@@ -167,14 +153,13 @@ typedef CB_ALIGN_PRE struct cbWorker {
                                  * CLAIMED by a waker */
     EpicsAtomicPtrT handoff;    /* cbNode list handed over by a waker, or
                                  * NULL; stealable */
-    EpicsAtomicPtrT pending;    /* our pending list beyond the batch being
-                                 * run; stealable */
-    int progress;               /* atomic: batches started */
+    EpicsAtomicPtrT pending;    /* the list we are running, oldest first;
+                                 * stealable */
+    int busy;                   /* atomic: inside a callback */
     epicsThreadId tid;
     unsigned idx;
     cbNode **seenSlot;          /* what this worker saw in others' slots at
                                  * its last look */
-    int *seenProgress;
     epicsUInt64 lastLook;       /* when it last looked */
 } CB_ALIGN_POST cbWorker;
 
@@ -186,7 +171,7 @@ typedef struct cbQueueSet {
     int nQueued;            /* atomic: nodes taken but not yet run */
     int maxQueued;          /* atomic, racy high-water mark */
     int queueOverflows;
-    int batches;            /* atomic: batches started by any worker */
+    int batches;            /* atomic: progress by any worker */
     int lastBatches;        /* atomic: batches as last seen by a requester
                              * behind a backlog */
     size_t staleSince;      /* atomic: when (us) a requester first saw that
@@ -492,89 +477,7 @@ static void pokeSleeper(cbQueueSet *mySet)
     }
 }
 
-/* hand ceil(p/2) of the p pending callbacks to a sleeping worker, if
- * any. Pending work is the n nodes of *plist (newest last) plus the
- * batch entries batch[*pk - 1] down to batch[i] whose nodes were
- * already returned to the pool; those get fresh nodes. Returns the
- * number of nodes left in *plist. */
-static int shareWithSleeper(cbQueueSet *mySet, cbWorker *me, cbNode **plist,
-                            int n, epicsCallback **batch, int *pk, int i)
-{
-    int p = n + (*pk - i), give, fromList, fromBatch, keep, j;
-    cbNode *head = NULL, *tail = NULL, *cut = NULL;
-
-    if (p < 1 || epicsAtomicGetSizeT(&mySet->sleepers) == 0)
-        return n;
-    /* reclaim the published list; NULL means an idle worker stole it */
-    if (n && epicsAtomicCmpAndSwapPtrT(&me->pending, *plist, NULL) != *plist) {
-        *plist = NULL;
-        n = 0;
-        p = *pk - i;
-        if (p < 1) return 0;
-    }
-    give = (p + 1) / 2;
-    fromList = give < n ? give : n;
-    fromBatch = give - fromList;
-    /* nodes for the batch part (older than the list part) */
-    for (j = 0; j < fromBatch; j++) {
-        cbNode *nd = nodeAlloc(mySet);
-        if (!nd) break;
-        nd->cb = batch[*pk - fromBatch + j];
-        nd->next = NULL;
-        if (tail) tail->next = nd; else head = nd;
-        tail = nd;
-    }
-    /* pool exhausted: hand only what has nodes; the newest keep
-     * entries stay in batch[], untouched until the handover succeeds */
-    keep = fromBatch - j;
-    fromBatch = j;
-    if (fromList) {
-        cut = *plist;
-        for (j = 1; j < n - fromList; j++)
-            cut = cut->next;
-        if (fromList == n) {
-            if (tail) tail->next = *plist; else head = *plist;
-            *plist = NULL;
-        }
-        else {
-            if (tail) tail->next = cut->next; else head = cut->next;
-            cut->next = NULL;
-        }
-    }
-    if (!head) {
-        if (*plist) epicsAtomicSetPtrT(&me->pending, *plist);
-        return n;
-    }
-    if (fromBatch)
-        epicsAtomicAddIntT(&mySet->nQueued, fromBatch);
-    if (!wakeOne(mySet, head, fromBatch + fromList)) {
-        /* sleeper vanished: undo. Batch part goes back to the pool, its
-         * entries are still in batch[]; list part is re-attached. */
-        if (fromBatch) {
-            cbNode *bl = head, *bt = head;
-            for (j = 1; j < fromBatch; j++) bt = bt->next;
-            if (fromList) {
-                if (fromList == n) *plist = bt->next;
-                else cut->next = bt->next;
-            }
-            bt->next = NULL;
-            nodeFreeChain(mySet, bl, bt);
-            epicsAtomicAddIntT(&mySet->nQueued, -fromBatch);
-        } else {
-            if (fromList == n) *plist = head; else cut->next = head;
-        }
-        if (*plist) epicsAtomicSetPtrT(&me->pending, *plist);
-        return n;
-    }
-    /* drop the handed entries from batch[], sliding the kept ones down */
-    for (j = 0; j < keep; j++)
-        batch[*pk - fromBatch - keep + j] = batch[*pk - keep + j];
-    *pk -= fromBatch;
-    if (*plist) epicsAtomicSetPtrT(&me->pending, *plist);
-    return n - fromList;
-}
-
-/* take the whole list in another worker's slot, counting it */
+/* take the whole list in a slot, counting it */
 static cbNode *takeSlot(EpicsAtomicPtrT *slot, int *pn)
 {
     cbNode *l, *q;
@@ -589,99 +492,161 @@ static cbNode *takeSlot(EpicsAtomicPtrT *slot, int *pn)
     return l;
 }
 
+/* pop the first node of our own pending slot; NULL once it was stolen */
+static cbNode *popSlot(EpicsAtomicPtrT *slot)
+{
+    cbNode *h;
+
+    do {
+        h = epicsAtomicGetPtrT(slot);
+        if (!h) return NULL;
+    } while (epicsAtomicCmpAndSwapPtrT(slot, h, h->next) != h);
+    return h;
+}
+
+/* while a worker sleeps: add what the inbox holds to our pending list
+ * and hand the older half of it to that sleeper, keeping at least the
+ * node we are about to run. Our list is taken out of the slot while
+ * it is cut and put back after, and the sleepers are read again after
+ * each round: a worker that set its bit meanwhile is served by the
+ * next round, one that sets it later sees our list. Returns the number
+ * of nodes left in our slot. */
+static int shareWithSleepers(cbQueueSet *mySet, cbWorker *me, int n)
+{
+    for (;;) {
+        cbNode *list, *tail, *cut, *inb;
+        int k, give, j, changed = 0;
+
+        if (epicsAtomicGetSizeT(&mySet->sleepers) == 0)
+            return n;
+        list = takeSlot(&me->pending, &n);
+        inb = grabInbox(mySet, &k);
+        if (inb) {
+            if (list) {
+                for (tail = list; tail->next; tail = tail->next);
+                tail->next = inb;
+            }
+            else
+                list = inb;
+            n += k;
+            changed = 1;
+        }
+        if (n >= 2) {
+            give = n / 2;
+            for (cut = list, j = 1; j < give; j++) cut = cut->next;
+            tail = cut->next;
+            cut->next = NULL;
+            if (wakeOne(mySet, list, give)) {
+                list = tail;
+                n -= give;
+                changed = 1;
+            }
+            else
+                cut->next = tail;
+        }
+        if (list)
+            epicsAtomicSetPtrT(&me->pending, list);
+        if (!changed)
+            return n;
+    }
+}
+
 /* an idle worker takes the pending or handed-over list of another
- * worker that has not progressed since the list was last seen there */
+ * worker that cannot run it now: one inside a callback, or one whose
+ * slot is unchanged since our previous look CB_STEAL_AGE_NS ago */
 static cbNode *stealWork(cbQueueSet *mySet, cbWorker *me, int *pn)
 {
     int j;
-
     epicsUInt64 now = epicsMonotonicGet();
+    int look = now - me->lastLook >= CB_STEAL_AGE_NS;
 
-    if (now - me->lastLook < CB_STEAL_AGE_NS) {
-        *pn = 0;
-        return NULL;
-    }
-    me->lastLook = now;
+    if (look)
+        me->lastLook = now;
     for (j = 0; j < mySet->threadsConfigured; j++) {
         cbWorker *w = &mySet->workers[j];
         cbNode *pend, *hand, *l;
-        int prog;
+        int take;
         if (w == me) continue;
         pend = epicsAtomicGetPtrT(&w->pending);
         hand = epicsAtomicGetPtrT(&w->handoff);
-        prog = epicsAtomicGetIntT(&w->progress);
-        if ((pend || hand) && prog == me->seenProgress[j] &&
-            pend == me->seenSlot[2 * j] && hand == me->seenSlot[2 * j + 1]) {
-            if (pend) {
-                l = takeSlot(&w->pending, pn);
-                if (l) return l;
-            }
-            if (hand) {
-                l = takeSlot(&w->handoff, pn);
-                if (l) return l;
-            }
+        take = (pend || hand) && epicsAtomicGetIntT(&w->busy);
+        if (look) {
+            if ((pend && pend == me->seenSlot[2 * j]) ||
+                (hand && hand == me->seenSlot[2 * j + 1]))
+                take = 1;
+            me->seenSlot[2 * j] = pend;
+            me->seenSlot[2 * j + 1] = hand;
         }
-        me->seenSlot[2 * j] = pend;
-        me->seenSlot[2 * j + 1] = hand;
-        me->seenProgress[j] = prog;
+        if (!take) continue;
+        if (pend) {
+            l = takeSlot(&w->pending, pn);
+            if (l) return l;
+        }
+        if (hand) {
+            l = takeSlot(&w->handoff, pn);
+            if (l) return l;
+        }
     }
     *pn = 0;
     return NULL;
 }
 
-/* run a list of n nodes, returning nodes to the pool a batch at a time
- * before the batch runs, so a callback may re-request itself without
- * needing its own node back; before each callback, pending work is
- * shared with a sleeping worker */
+/* whether some worker is neither sleeping nor inside a callback, so
+ * will read the inbox before its next callback or sleep */
+static int anyReady(cbQueueSet *mySet)
+{
+    int j;
+
+    for (j = 0; j < mySet->threadsConfigured; j++) {
+        cbWorker *w = &mySet->workers[j];
+        if (CB_ST(epicsAtomicGetSizeT(&w->state)) != CB_SLEEPING &&
+            !epicsAtomicGetIntT(&w->busy))
+            return 1;
+    }
+    return 0;
+}
+
+/* run a list of n nodes. The list stays in our pending slot, where an
+ * idle worker can take it while we are inside a callback. Nodes go
+ * back to the pool, nQueued and batches are updated, every
+ * CB_SHARE_EVERY callbacks. */
 static void runList(cbQueueSet *mySet, cbWorker *me, cbNode *list, int n)
 {
-    epicsCallback *batch[CB_SHARE_EVERY];
-    cbNode *pub = NULL;     /* what we have published in me->pending */
-    int k = 0, i = 0;
+    cbNode *done = NULL, *doneLast = NULL;  /* ran, not yet returned to the pool */
+    int ran = 0;
 
+    epicsAtomicSetPtrT(&me->pending, list);
     for (;;) {
-        if (i == k) {
-            cbNode *first, *last;
-            /* reclaim the published list; NULL means an idle worker stole it */
-            if (pub) {
-                if (epicsAtomicCmpAndSwapPtrT(&me->pending, pub, NULL) != pub) {
-                    list = NULL;
-                    n = 0;
-                }
-                pub = NULL;
-            }
-            if (!list) return;
-            first = list;
-            k = 0;
-            for (;;) {
-                batch[k++] = list->cb;
-                last = list;
-                list = list->next;
-                if (!list || k == CB_SHARE_EVERY)
-                    break;
-            }
-            nodeFreeChain(mySet, first, last);
-            n -= k;
-            epicsAtomicAddIntT(&mySet->nQueued, -k);
-            epicsAtomicIncrIntT(&me->progress);
+        cbNode *nd;
+        epicsCallback *cb;
+
+        /* busy first, then look at the sleepers and the inbox: a
+         * request pushed after this finds us busy and wakes a sleeper
+         * itself, one pushed before is handed to a sleeper here */
+        epicsAtomicSetIntT(&me->busy, 1);
+        n = shareWithSleepers(mySet, me, n);
+        nd = popSlot(&me->pending);
+        if (!nd) break;
+        n--;
+        cb = nd->cb;
+        nd->next = done;
+        done = nd;
+        if (!doneLast) doneLast = nd;
+        if (++ran == CB_SHARE_EVERY) {
+            nodeFreeChain(mySet, done, doneLast);
+            done = doneLast = NULL;
+            epicsAtomicAddIntT(&mySet->nQueued, -ran);
             epicsAtomicIncrIntT(&mySet->batches);
-            i = 0;
-            /* the rest is stealable while this batch runs */
-            if (list) {
-                epicsAtomicSetPtrT(&me->pending, list);
-                pub = list;
-            }
+            ran = 0;
         }
-        /* keep halving the pending work into sleepers while any sleep */
-        for (;;) {
-            int before = n + k;
-            n = shareWithSleeper(mySet, me, &list, n, batch, &k, i + 1);
-            if (n + k == before || n + (k - i - 1) < 1)
-                break;
-        }
-        pub = list;
-        (*batch[i]->callback)(batch[i]);
-        i++;
+        (*cb->callback)(cb);
+        epicsAtomicSetIntT(&me->busy, 0);
+    }
+    epicsAtomicSetIntT(&me->busy, 0);
+    if (ran) {
+        nodeFreeChain(mySet, done, doneLast);
+        epicsAtomicAddIntT(&mySet->nQueued, -ran);
+        epicsAtomicIncrIntT(&mySet->batches);
     }
 }
 
@@ -711,16 +676,12 @@ static void callbackTask(void *arg)
             runList(mySet, me, list, n);
             continue;
         }
-        list = stealWork(mySet, me, &n);
-        if (list) {
-            runList(mySet, me, list, n);
-            continue;
-        }
 
         /* announce sleep with a fresh epoch (state, hint bit, count),
-         * then re-check the inbox and our slot: a request pushed or a
-         * list stored before this point is seen here; one after it sees
-         * nAwake==0 or our bit, and our SLEEPING state behind it.
+         * then look at the inbox, our slot and the other workers'
+         * slots: a request pushed or a list stored before this point
+         * is seen here; one after it sees nAwake==0 or our bit, and
+         * our SLEEPING state behind it.
          * Leaving the sleep by ourselves counts us awake; if a waker
          * claimed us first, it counted us and its trigger stays stored
          * in the event. */
@@ -733,7 +694,8 @@ static void callbackTask(void *arg)
             }
             epicsAtomicDecrIntT(&mySet->nAwake);
             if (epicsAtomicGetPtrT(&mySet->inbox) == NULL &&
-                epicsAtomicGetPtrT(&me->handoff) == NULL)
+                epicsAtomicGetPtrT(&me->handoff) == NULL &&
+                (list = stealWork(mySet, me, &n)) == NULL)
                 epicsEventMustWait(me->wake);
             if (epicsAtomicCmpAndSwapSizeT(&me->state, sleeping,
                     CB_STATE(epoch, CB_AWAKE)) == sleeping)
@@ -741,6 +703,8 @@ static void callbackTask(void *arg)
             else
                 epicsAtomicSetSizeT(&me->state, CB_STATE(epoch, CB_AWAKE));
             takeSleeperBit(mySet, me->idx & 0xff);
+            if (list)
+                runList(mySet, me, list, n);
         }
     }
 
@@ -788,7 +752,6 @@ void callbackCleanup(void)
         for(j=0; j<mySet->threadsConfigured; j++) {
             epicsEventDestroy(mySet->workers[j].wake);
             free(mySet->workers[j].seenSlot);
-            free(mySet->workers[j].seenProgress);
         }
         free(mySet->workersRaw);
         mySet->workers = NULL;
@@ -860,8 +823,6 @@ void callbackInit(void)
             w->idx = (i << 8) | j;
             w->seenSlot = callocMustSucceed(2 * callbackQueue[i].threadsConfigured,
                                             sizeof(*w->seenSlot), "callbackInit");
-            w->seenProgress = callocMustSucceed(callbackQueue[i].threadsConfigured,
-                                                sizeof(*w->seenProgress), "callbackInit");
             w->wake = epicsEventMustCreate(epicsEventEmpty);
             w->tid = tid = epicsThreadCreateOpt(threadName,
                 (EPICSTHREADFUNC)callbackTask, w, &opts);
@@ -921,15 +882,22 @@ int callbackRequest(epicsCallback *pcallback)
             node->next = old;
         } while (epicsAtomicCmpAndSwapPtrT(&mySet->inbox, old, node) != old);
 
-        /* a worker that is awake will take this; recruiting more is its
-         * job. But if only one of several workers is counted awake and
-         * for CB_STALE_US no batch has been started, that worker is
+        /* a worker that is awake and not inside a callback will take
+         * this; recruiting more is its job. If every awake worker is
+         * inside a callback while one sleeps, wake it now; that check
+         * is owed only when the inbox was empty, as a request already
+         * there has a worker on its way whose take-all covers ours.
+         * And if only one of several workers is counted awake and for
+         * CB_STALE_US no worker made progress, that worker is
          * stopped, so wake a sleeper now. nAwake lags its claim CAS: a
          * claimer stopped between the claim and its increment lets the
          * claimed worker run and sleep first, so the count can read
          * below zero; anything non-positive means nobody is counted. */
         awake = epicsAtomicGetIntT(&mySet->nAwake);
         if (awake <= 0)
+            pokeSleeper(mySet);
+        else if (old == NULL && awake < mySet->threadsConfigured
+                 && epicsAtomicGetSizeT(&mySet->sleepers) && !anyReady(mySet))
             pokeSleeper(mySet);
         else if (awake == 1 && mySet->threadsConfigured > 1) {
             int b = epicsAtomicGetIntT(&mySet->batches);
