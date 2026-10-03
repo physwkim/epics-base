@@ -116,7 +116,9 @@ static unsigned cbLowBit(size_t m)
 #  define CB_LOWBIT(m) cbLowBit(m)
 #endif
 
-/* each worker on its own cache lines: the slots are written per callback */
+/* each worker, and each shared word of a queue, on its own pair of
+ * cache lines: adjacent-line prefetch would otherwise drag a line the
+ * other side writes per callback along with one this side only reads */
 #define CB_WORKER_ALIGN 128
 #if defined(_MSC_VER)
 #  define CB_ALIGN_PRE  __declspec(align(CB_WORKER_ALIGN))
@@ -163,11 +165,11 @@ typedef CB_ALIGN_PRE struct cbWorker {
     epicsUInt64 lastLook;       /* when it last looked */
 } CB_ALIGN_POST cbWorker;
 
-typedef struct cbQueueSet {
+typedef CB_ALIGN_PRE struct cbQueueSet {
     EpicsAtomicPtrT inbox;  /* cbNode*, newest first */
-    char pad0[64 - sizeof(EpicsAtomicPtrT)];
+    char pad0[CB_WORKER_ALIGN - sizeof(EpicsAtomicPtrT)];
     size_t freeHead;        /* atomic, CB_PACK(index, tag) */
-    char pad1[64 - sizeof(size_t)];
+    char pad1[CB_WORKER_ALIGN - sizeof(size_t)];
     int nQueued;            /* atomic: nodes taken but not yet run */
     int maxQueued;          /* atomic, racy high-water mark */
     int queueOverflows;
@@ -176,20 +178,20 @@ typedef struct cbQueueSet {
                              * behind a backlog */
     size_t staleSince;      /* atomic: when (us) a requester first saw that
                              * value behind a backlog, 0 if none */
-    char pad2[64 - 5 * sizeof(int) - sizeof(size_t)];
+    char pad2[CB_WORKER_ALIGN - 5 * sizeof(int) - sizeof(size_t)];
     size_t sleepers;        /* atomic bitmask hint: SLEEPING workers nobody
                              * has taken yet; set by the worker, cleared by
                              * its taker or the worker */
     int nAwake;             /* atomic: workers not SLEEPING (incl. CLAIMED);
                              * lags the claim CAS, so it can read below 0 */
-    char pad3[64 - sizeof(size_t) - sizeof(int)];
+    char pad3[CB_WORKER_ALIGN - sizeof(size_t) - sizeof(int)];
     cbNode *pool;
     int shutdown; // use atomic
     int threadsConfigured;
     int threadsRunning;
     cbWorker *workers;
     void *workersRaw;       /* allocation behind the aligned workers array */
-} cbQueueSet;
+} CB_ALIGN_POST cbQueueSet;
 
 static cbQueueSet callbackQueue[NUM_CALLBACK_PRIORITIES];
 
