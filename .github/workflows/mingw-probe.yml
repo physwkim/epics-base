@@ -1,0 +1,16 @@
+# Probe for epics-base/epics-base#1005: which libstdc++ a Strawberry-gcc
+# mingw test exe loads when run from a make recipe on the windows-2022 image.
+name: mingw-probe
+on:
+  push:
+    branches: [ci/mingw-path-probe]
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+    - name: choco install make
+      run: choco install make -y --limitoutput --no-progress
+    - name: probe
+      run: python probe/probe.py
