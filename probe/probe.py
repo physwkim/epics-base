@@ -24,16 +24,16 @@ show('git --version', 'git --version')
 show('g++ --version', 'g++ --version')
 show('make --version', 'make --version')
 
-show('make TAG=default (sh from PATH)', 'make TAG=default')
-show('make TAG=cmd (SHELL=cmd.exe)', 'make TAG=cmd SHELL=cmd.exe')
+show('make TAG=default (sh from PATH)', 'make -k TAG=default')
+show('make TAG=cmd (SHELL=cmd.exe)', 'make -k TAG=cmd SHELL=cmd.exe')
 nogit = os.pathsep.join(p for p in os.environ['PATH'].split(os.pathsep)
                         if 'Git' not in p)
-show('make TAG=nogit (Git dirs removed from PATH)', 'make TAG=nogit',
+show('make TAG=nogit (Git dirs removed from PATH)', 'make -k TAG=nogit',
      env=dict(os.environ, PATH=nogit))
 show('direct (no make)', 'perl run.pl probe.exe probe.cpp > out-direct.txt 2>&1')
 show('direct env', 'perl env.pl > env-direct.txt')
 
-for f in sorted(glob.glob('env-*.txt') + glob.glob('out-*.txt')):
+for f in sorted(glob.glob('env-*.txt') + glob.glob('out*-*.txt')):
     print('::group::' + f, flush=True)
     with open(f, errors='replace') as fp:
         print(fp.read(), flush=True)
