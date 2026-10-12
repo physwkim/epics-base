@@ -1,0 +1,16 @@
+# run the real iocshTest.exe from a make recipe (make's shell on PATH is
+# Git's sh.exe) and under gdb for a symbolized backtrace
+TAG ?= sh
+GDB ?= C:/Strawberry/c/bin/gdb.exe
+PERL ?= C:/Strawberry/perl/bin/perl
+
+all: run-$(TAG).txt tap-$(TAG).txt gdb-$(TAG).txt
+
+run-$(TAG).txt:
+	-iocshTest.exe > run-$(TAG).txt 2>&1
+
+tap-$(TAG).txt:
+	-$(PERL) -CSD iocshTest.t -tap > tap-$(TAG).txt 2>&1
+
+gdb-$(TAG).txt:
+	-$(GDB) -batch -ex "set pagination off" -ex run -ex bt -ex "info sharedlibrary" -ex "x/8i \$$pc" --args iocshTest.exe > gdb-$(TAG).txt 2>&1
