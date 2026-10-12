@@ -2,6 +2,7 @@
 # mingw test exe loads when run from a make recipe on the windows-2022 image.
 name: mingw-probe
 on:
+  workflow_dispatch:
   push:
     branches: [ci/mingw-path-probe]
 jobs:
